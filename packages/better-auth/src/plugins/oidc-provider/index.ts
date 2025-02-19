@@ -545,7 +545,7 @@ export const oidcProvider = (options: OIDCOptions) => {
 						...(requestedScopes.includes("email") ? email : {}),
 					};
 
-					const idToken = await new SignJWT({
+					const payload = {
 						sub: user.id,
 						aud: client_id.toString(),
 						iat: Date.now(),
@@ -553,13 +553,14 @@ export const oidcProvider = (options: OIDCOptions) => {
 						nonce: value.nonce,
 						acr: "urn:mace:incommon:iap:silver", // default to silver - ⚠︎ this should be configurable and should be validated against the client's metadata
 						...userClaims,
-					})
+					}
+					const idToken = await new SignJWT(payload)
 						.setProtectedHeader({ alg, kid: key.id })
 						.setIssuedAt()
 						.setExpirationTime(
 							Math.floor(Date.now() / 1000) + opts.accessTokenExpiresIn,
 						)
-						.setIssuer(ctx.context.baseURL)
+						.setIssuer(ctx.context.options.baseURL!)
 						.sign(privateKey);
 
 					return ctx.json(
