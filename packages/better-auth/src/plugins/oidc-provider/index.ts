@@ -1,4 +1,4 @@
-import { SignJWT } from "jose";
+import { importJWK, SignJWT } from "jose";
 import { z } from "zod";
 import {
 	APIError,
@@ -8,7 +8,7 @@ import {
 	sessionMiddleware,
 } from "../../api";
 import type { BetterAuthPlugin, GenericEndpointContext } from "../../types";
-import { generateRandomString } from "../../crypto";
+import { generateRandomString, symmetricDecrypt } from "../../crypto";
 import { subtle } from "@better-auth/utils";
 import { schema } from "./schema";
 import type {
@@ -22,6 +22,7 @@ import { authorize } from "./authorize";
 import { parseSetCookieHeader } from "../../cookies";
 import { createHash } from "@better-auth/utils/hash";
 import { base64 } from "@better-auth/utils/base64";
+import { getJwksAdapter } from "../jwt/adapter";
 
 const getMetadata = (
 	ctx: GenericEndpointContext,
@@ -549,17 +550,17 @@ export const oidcProvider = (options: OIDCOptions) => {
 							error: "invalid_grant",
 						});
 					}
-					let secretKey = {
-						alg: "HS256",
-						key: await subtle.generateKey(
-							{
-								name: "HMAC",
-								hash: "SHA-256",
-							},
-							true,
-							["sign", "verify"],
-						),
-					};
+					const adapter = getJwksAdapter(ctx.context.adapter);
+
+					// We are going to assume getLatestKey exists and the privateKey is encrypted
+					const key = await adapter.getLatestKey();
+					const alg = JSON.parse(key.publicKey).alg;
+					const decrypted = await symmetricDecrypt({
+						key: ctx.context.secret,
+						data: JSON.parse(key.privateKey),
+					});
+					const privateKey = await importJWK(JSON.parse(decrypted), alg);
+
 					const profile = {
 						given_name: user.name.split(" ")[0],
 						family_name: user.name.split(" ")[1],
@@ -590,12 +591,13 @@ export const oidcProvider = (options: OIDCOptions) => {
 						...userClaims,
 						...additionalUserClaims,
 					})
-						.setProtectedHeader({ alg: secretKey.alg })
+						.setProtectedHeader({ alg, kid: key.id })
 						.setIssuedAt()
 						.setExpirationTime(
 							Math.floor(Date.now() / 1000) + opts.accessTokenExpiresIn,
 						)
-						.sign(secretKey.key);
+						.setIssuer(ctx.context.baseURL)
+						.sign(privateKey);
 
 					return ctx.json(
 						{
