@@ -1,5 +1,5 @@
 {
-  "name": "better-auth",
+  "name": "@runreal/better-auth",
   "version": "1.2.6-beta.6",
   "description": "The most comprehensive authentication library for TypeScript.",
   "type": "module",
