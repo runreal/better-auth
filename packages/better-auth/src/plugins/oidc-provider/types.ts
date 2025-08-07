@@ -153,6 +153,25 @@ export interface OIDCOptions {
 	 * @default false
 	 */
 	useJWTPlugin?: boolean;
+	/**
+	 * Whether to generate JWT access tokens instead of opaque session tokens.
+	 * When enabled, access tokens will be signed JWTs containing user claims.
+	 * This is required for compatibility with systems that expect JWT Bearer tokens.
+	 * 
+	 * @default false
+	 */
+	generateJWTAccessTokens?: boolean;
+	/**
+	 * The default audience (aud) claim for JWT access tokens. This should be the identifier
+	 * of the resource server (API) that will accept the access token.
+	 * 
+	 * Can be overridden per-client by setting `metadata.audience` in the client configuration.
+	 * If not specified, defaults to the base URL of the auth server.
+	 * 
+	 * @example "https://api.example.com"
+	 * @example "https://runreal-ixucr9.live.runreal.net"
+	 */
+	accessTokenAudience?: string;
 }
 
 export interface AuthorizationQuery {
@@ -310,8 +329,13 @@ export interface Client {
 	icon?: string;
 	/**
 	 * Additional metadata about the client.
+	 * 
+	 * Can include:
+	 * - `audience`: The audience (aud) claim for JWT access tokens issued to this client
+	 * - Other custom metadata as needed
 	 */
 	metadata: {
+		audience?: string;
 		[key: string]: any;
 	} | null;
 	/**

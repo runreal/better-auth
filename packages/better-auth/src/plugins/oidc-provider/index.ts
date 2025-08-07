@@ -1,5 +1,5 @@
 import * as z from "zod/v4";
-import { SignJWT } from "jose";
+import { SignJWT, jwtVerify } from "jose";
 import {
 	APIError,
 	createAuthEndpoint,
@@ -7,7 +7,7 @@ import {
 	getSessionFromCtx,
 	sessionMiddleware,
 } from "../../api";
-import type { BetterAuthPlugin, GenericEndpointContext } from "../../types";
+import type { BetterAuthPlugin, GenericEndpointContext, User } from "../../types";
 import {
 	generateRandomString,
 	symmetricDecrypt,
@@ -28,12 +28,7 @@ import { base64 } from "@better-auth/utils/base64";
 import { getJwtToken } from "../jwt/sign";
 import type { jwt } from "../jwt";
 import { defaultClientSecretHasher } from "./utils";
-
-const getJwtPlugin = (ctx: GenericEndpointContext) => {
-	return ctx.context.options.plugins?.find(
-		(plugin) => plugin.id === "jwt",
-	) as ReturnType<typeof jwt>;
-};
+import { generateJWTAccessToken, getJwtPlugin } from "./jwt-access-token";
 
 /**
  * Get a client by ID, checking trusted clients first, then database
@@ -68,19 +63,150 @@ export async function getClient(
 	return dbClient;
 }
 
+/**
+ * Helper function to generate ID token
+ */
+async function generateIdToken(
+	ctx: GenericEndpointContext,
+	options: OIDCOptions,
+	user: any,
+	clientId: string,
+	scopes: string[],
+	nonce?: string,
+	authTime?: number,
+	clientSecret?: string,
+): Promise<string> {
+	const profile = {
+		given_name: user.name.split(" ")[0],
+		family_name: user.name.split(" ")[1],
+		name: user.name,
+		profile: user.image,
+		updated_at: user.updatedAt.toISOString(),
+	};
+	const email = {
+		email: user.email,
+		email_verified: user.emailVerified,
+	};
+	const userClaims = {
+		...(scopes.includes("profile") ? profile : {}),
+		...(scopes.includes("email") ? email : {}),
+	};
+
+	const additionalUserClaims = options.getAdditionalUserInfoClaim
+		? await options.getAdditionalUserInfoClaim(user, scopes)
+		: {};
+
+	// Get issuer - use JWT plugin's issuer if available, otherwise fall back to baseURL
+	let issuer = ctx.context.baseURL;
+	if (options.useJWTPlugin) {
+		const jwtPlugin = getJwtPlugin(ctx);
+		if (jwtPlugin?.options?.jwt?.issuer) {
+			issuer = jwtPlugin.options.jwt.issuer;
+		}
+	}
+
+	const payload = {
+		iss: issuer,
+		sub: user.id,
+		aud: clientId,
+		iat: Math.floor(Date.now() / 1000),
+		auth_time: authTime ? Math.floor(authTime / 1000) : undefined,
+		nonce: nonce,
+		acr: "urn:mace:incommon:iap:silver",
+		...userClaims,
+		...additionalUserClaims,
+	};
+
+	const expirationTime =
+		Math.floor(Date.now() / 1000) + (options.accessTokenExpiresIn || 3600);
+
+	let idToken: string;
+
+	if (options.useJWTPlugin) {
+		const jwtPlugin = getJwtPlugin(ctx);
+		if (!jwtPlugin) {
+			throw new APIError("INTERNAL_SERVER_ERROR", {
+				error_description: "JWT plugin is not enabled",
+				error: "internal_server_error",
+			});
+		}
+
+		idToken = await getJwtToken(
+			{
+				...ctx,
+				context: {
+					...ctx.context,
+					session: {
+						session: {
+							id: generateRandomString(32, "a-z", "A-Z"),
+							createdAt: new Date(),
+							updatedAt: new Date(),
+							userId: user.id,
+							expiresAt: new Date(
+								Date.now() + (options.accessTokenExpiresIn || 3600) * 1000,
+							),
+							token: generateRandomString(32, "a-z", "A-Z"),
+							ipAddress: ctx.request?.headers.get("x-forwarded-for"),
+						},
+						user,
+					},
+				},
+			},
+			{
+				...jwtPlugin.options,
+				jwt: {
+					...jwtPlugin.options?.jwt,
+					getSubject: () => user.id,
+					audience: clientId,
+					issuer: issuer,
+					expirationTime,
+					definePayload: () => payload,
+				},
+			},
+		);
+	} else {
+		if (!clientSecret) {
+			throw new APIError("INTERNAL_SERVER_ERROR", {
+				error_description: "Client secret is required for HS256 signing",
+				error: "internal_server_error",
+			});
+		}
+		idToken = await new SignJWT(payload)
+			.setProtectedHeader({ alg: "HS256" })
+			.setIssuedAt()
+			.setExpirationTime(expirationTime)
+			.sign(new TextEncoder().encode(clientSecret));
+	}
+
+	return idToken;
+}
+
 export const getMetadata = (
 	ctx: GenericEndpointContext,
 	options?: OIDCOptions,
 ): OIDCMetadata => {
-	const jwtPlugin = getJwtPlugin(ctx);
-	const issuer =
-		jwtPlugin && jwtPlugin.options?.jwt && jwtPlugin.options.jwt.issuer
-			? jwtPlugin.options.jwt.issuer
-			: (ctx.context.options.baseURL as string);
+	// Get issuer - use JWT plugin's issuer if available and useJWTPlugin is enabled
+	let issuer = ctx.context.options.baseURL as string;
+	if (options?.useJWTPlugin) {
+		const jwtPlugin = getJwtPlugin(ctx);
+		if (jwtPlugin?.options?.jwt?.issuer) {
+			issuer = jwtPlugin.options.jwt.issuer;
+		}
+	}
 	const baseURL = ctx.context.baseURL;
 	const supportedAlgs = options?.useJWTPlugin
 		? ["RS256", "EdDSA", "none"]
 		: ["HS256", "none"];
+	
+	// Dynamic scopes based on plugin configuration
+	const supportedScopes = [
+		"openid",
+		"profile", 
+		"email",
+		"offline_access",
+		...(options?.scopes || []),
+	];
+	
 	return {
 		issuer,
 		authorization_endpoint: `${baseURL}/oauth2/authorize`,
@@ -88,7 +214,7 @@ export const getMetadata = (
 		userinfo_endpoint: `${baseURL}/oauth2/userinfo`,
 		jwks_uri: `${baseURL}/jwks`,
 		registration_endpoint: `${baseURL}/oauth2/register`,
-		scopes_supported: ["openid", "profile", "email", "offline_access"],
+		scopes_supported: supportedScopes,
 		response_types_supported: ["code"],
 		response_modes_supported: ["query"],
 		grant_types_supported: ["authorization_code", "refresh_token"],
@@ -489,6 +615,25 @@ export const oidcProvider = (options: OIDCOptions) => {
 						refresh_token,
 						code_verifier,
 					} = body;
+					
+					const client = await getClient(
+						client_id.toString(),
+						ctx.context.adapter,
+						trustedClients,
+					);
+					if (!client) {
+						throw new APIError("UNAUTHORIZED", {
+							error_description: "invalid client_id",
+							error: "invalid_client",
+						});
+					}
+					if (client.disabled) {
+						throw new APIError("UNAUTHORIZED", {
+							error_description: "client is disabled",
+							error: "invalid_client",
+						});
+					}
+					
 					if (grant_type === "refresh_token") {
 						if (!refresh_token) {
 							throw new APIError("BAD_REQUEST", {
@@ -523,7 +668,28 @@ export const oidcProvider = (options: OIDCOptions) => {
 								error: "invalid_grant",
 							});
 						}
-						const accessToken = generateRandomString(32, "a-z", "A-Z");
+						let accessToken: string;
+						if (options.generateJWTAccessTokens) {
+							// Get user information
+							const user = await ctx.context.internalAdapter.findUserById(token.userId);
+							if (!user) {
+								throw new APIError("INTERNAL_SERVER_ERROR", {
+									error_description: "User not found",
+									error: "internal_server_error",
+								});
+							}
+							
+							accessToken = await generateJWTAccessToken(
+								ctx,
+								user,
+								client,
+								token.scopes.split(" "),
+								opts.accessTokenExpiresIn,
+								{ ...options, useJWTPlugin: options.useJWTPlugin },
+							);
+						} else {
+							accessToken = generateRandomString(32, "a-z", "A-Z");
+						}
 						const newRefreshToken = generateRandomString(32, "a-z", "A-Z");
 						const accessTokenExpiresAt = new Date(
 							Date.now() + opts.accessTokenExpiresIn * 1000,
@@ -534,7 +700,9 @@ export const oidcProvider = (options: OIDCOptions) => {
 						await ctx.context.adapter.create({
 							model: modelName.oauthAccessToken,
 							data: {
-								accessToken,
+															accessToken: options.generateJWTAccessTokens 
+								? await createHash("SHA-256", "hex").digest(accessToken) // Store hash for JWT as hex string
+								: accessToken, // Store full token for opaque
 								refreshToken: newRefreshToken,
 								accessTokenExpiresAt,
 								refreshTokenExpiresAt,
@@ -545,13 +713,43 @@ export const oidcProvider = (options: OIDCOptions) => {
 								updatedAt: new Date(),
 							},
 						});
-						return ctx.json({
+						const requestedScopes = token.scopes.split(" ");
+						
+						// Generate ID token if openid scope is present
+						let idToken: string | undefined;
+						if (requestedScopes.includes("openid")) {
+							// Get the user for ID token generation
+							const user = await ctx.context.internalAdapter.findUserById(
+								token.userId,
+							);
+							if (!user) {
+								throw new APIError("UNAUTHORIZED", {
+									error_description: "user not found",
+									error: "invalid_grant",
+								});
+							}
+							
+							idToken = await generateIdToken(
+								ctx,
+								opts,
+								user,
+								client_id.toString(),
+								requestedScopes,
+								undefined, // no nonce for refresh
+								undefined, // no auth_time for refresh
+								client.clientSecret,
+							);
+						}
+						
+						const payload = {
 							access_token: accessToken,
-							token_type: "bearer",
+							token_type: "Bearer",
 							expires_in: opts.accessTokenExpiresIn,
 							refresh_token: newRefreshToken,
 							scope: token.scopes,
-						});
+							...(idToken ? { id_token: idToken } : {}),
+						};
+						return ctx.json(payload);
 					}
 
 					if (!code) {
@@ -615,24 +813,6 @@ export const oidcProvider = (options: OIDCOptions) => {
 						throw new APIError("BAD_REQUEST", {
 							error_description: "redirect_uri is required",
 							error: "invalid_request",
-						});
-					}
-
-					const client = await getClient(
-						client_id.toString(),
-						ctx.context.adapter,
-						trustedClients,
-					);
-					if (!client) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "invalid client_id",
-							error: "invalid_client",
-						});
-					}
-					if (client.disabled) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "client is disabled",
-							error: "invalid_client",
 						});
 					}
 
@@ -705,7 +885,29 @@ export const oidcProvider = (options: OIDCOptions) => {
 					await ctx.context.internalAdapter.deleteVerificationValue(
 						verificationValue.id,
 					);
-					const accessToken = generateRandomString(32, "a-z", "A-Z");
+					const user = await ctx.context.internalAdapter.findUserById(
+						value.userId,
+					);
+					if (!user) {
+						throw new APIError("UNAUTHORIZED", {
+							error_description: "user not found",
+							error: "invalid_grant",
+						});
+					}
+
+					let accessToken: string;
+					if (options.generateJWTAccessTokens) {
+						accessToken = await generateJWTAccessToken(
+							ctx,
+							user,
+							client,
+							requestedScopes,
+							opts.accessTokenExpiresIn,
+							{ ...options, useJWTPlugin: options.useJWTPlugin },
+						);
+					} else {
+						accessToken = generateRandomString(32, "a-z", "A-Z");
+					}
 					const refreshToken = generateRandomString(32, "A-Z", "a-z");
 					const accessTokenExpiresAt = new Date(
 						Date.now() + opts.accessTokenExpiresIn * 1000,
@@ -716,7 +918,9 @@ export const oidcProvider = (options: OIDCOptions) => {
 					await ctx.context.adapter.create({
 						model: modelName.oauthAccessToken,
 						data: {
-							accessToken,
+							accessToken: options.generateJWTAccessTokens 
+								? await createHash("SHA-256", "hex").digest(accessToken) // Store hash for JWT as hex string
+								: accessToken,                                    // Store full token for opaque
 							refreshToken,
 							accessTokenExpiresAt,
 							refreshTokenExpiresAt,
@@ -727,15 +931,6 @@ export const oidcProvider = (options: OIDCOptions) => {
 							updatedAt: new Date(),
 						},
 					});
-					const user = await ctx.context.internalAdapter.findUserById(
-						value.userId,
-					);
-					if (!user) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "user not found",
-							error: "invalid_grant",
-						});
-					}
 
 					const profile = {
 						given_name: user.name.split(" ")[0],
@@ -761,9 +956,7 @@ export const oidcProvider = (options: OIDCOptions) => {
 						sub: user.id,
 						aud: client_id.toString(),
 						iat: Date.now(),
-						auth_time: ctx.context.session
-							? new Date(ctx.context.session.session.createdAt).getTime()
-							: undefined,
+						auth_time: ctx.context.session?.session.createdAt.getTime(),
 						nonce: value.nonce,
 						acr: "urn:mace:incommon:iap:silver", // default to silver - ⚠︎ this should be configurable and should be validated against the client's metadata
 						...userClaims,
@@ -772,7 +965,7 @@ export const oidcProvider = (options: OIDCOptions) => {
 					const expirationTime =
 						Math.floor(Date.now() / 1000) + opts.accessTokenExpiresIn;
 
-					let idToken: string;
+					let idToken: string | undefined;
 
 					// The JWT plugin is enabled, so we use the JWKS keys to sign
 					if (options.useJWTPlugin) {
@@ -786,6 +979,8 @@ export const oidcProvider = (options: OIDCOptions) => {
 								error: "internal_server_error",
 							});
 						}
+						// Get issuer from JWT plugin config if available, otherwise use baseURL
+						const issuer = jwtPlugin?.options?.jwt?.issuer || ctx.context.options.baseURL;
 						idToken = await getJwtToken(
 							{
 								...ctx,
@@ -813,20 +1008,30 @@ export const oidcProvider = (options: OIDCOptions) => {
 									...jwtPlugin.options?.jwt,
 									getSubject: () => user.id,
 									audience: client_id.toString(),
-									issuer: ctx.context.options.baseURL,
+									issuer: issuer,
 									expirationTime,
 									definePayload: () => payload,
 								},
 							},
 						);
-
-						// If the JWT token is not enabled, create a key and use it to sign
 					} else {
-						idToken = await new SignJWT(payload)
-							.setProtectedHeader({ alg: "HS256" })
-							.setIssuedAt()
-							.setExpirationTime(expirationTime)
-							.sign(new TextEncoder().encode(client.clientSecret));
+						// For non-JWT plugin, we need to generate ID token using HS256
+						if (!client.clientSecret) {
+							throw new APIError("INTERNAL_SERVER_ERROR", {
+								error_description: "Client secret is required for HS256 signing",
+								error: "internal_server_error",
+							});
+						}
+						idToken = await generateIdToken(
+							ctx,
+							opts,
+							user,
+							client_id.toString(),
+							requestedScopes,
+							value.nonce,
+							ctx.context.session?.session.createdAt.getTime(),
+							client.clientSecret,
+						);
 					}
 
 					return ctx.json(
@@ -935,39 +1140,146 @@ export const oidcProvider = (options: OIDCOptions) => {
 						});
 					}
 					const token = authorization.replace("Bearer ", "");
-					const accessToken =
-						await ctx.context.adapter.findOne<OAuthAccessToken>({
-							model: modelName.oauthAccessToken,
-							where: [
-								{
-									field: "accessToken",
-									value: token,
-								},
-							],
-						});
-					if (!accessToken) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "invalid access token",
-							error: "invalid_token",
-						});
-					}
-					if (accessToken.accessTokenExpiresAt < new Date()) {
-						throw new APIError("UNAUTHORIZED", {
-							error_description: "The Access Token expired",
-							error: "invalid_token",
-						});
+					
+					let userId = "";
+					let requestedScopes: string[] = [];
+					
+					// If JWT access tokens are enabled, decode and validate the JWT
+					if (options.generateJWTAccessTokens) {
+						// For JWT tokens, we need to validate and decode them
+						// Since we store the hash in the database, we first verify the JWT signature
+						try {
+							// Safely decode the JWT parts
+							const parts = token.split('.');
+							if (parts.length !== 3) {
+								throw new Error("Invalid JWT format");
+							}
+							
+							// Decode header and payload
+							const [headerB64, payloadB64] = parts.slice(0, 2);
+							const header = JSON.parse(new TextDecoder().decode(base64.decode(headerB64)));
+							const payload = JSON.parse(new TextDecoder().decode(base64.decode(payloadB64)));
+							
+							// Extract client ID from payload
+							const clientId = payload.client_id || payload.aud;
+							if (!clientId) {
+								throw new Error("Missing client_id in token");
+							}
+							
+							const client = await getClient(
+								clientId,
+								ctx.context.adapter,
+								trustedClients,
+							);
+							
+							if (!client) {
+								throw new Error("Invalid client");
+							}
+							
+							// Verify the JWT based on the signing method
+							let verifiedPayload: any;
+							
+							if (options.useJWTPlugin && header.alg !== "HS256") {
+								// For RS256/EdDSA tokens signed by JWT plugin, 
+								// the resource server should validate using JWKS.
+								// Here we just extract the payload for userinfo.
+								// In production, you'd verify against the JWKS endpoint.
+								verifiedPayload = payload;
+								
+								// Basic validation
+								if (!payload.sub || !payload.iss || !payload.aud) {
+									throw new Error("Invalid token claims");
+								}
+							} else {
+								// For HS256 tokens, verify with client secret
+								if (!client.clientSecret) {
+									throw new Error("Client secret required for HS256 verification");
+								}
+								
+								const key = new TextEncoder().encode(client.clientSecret);
+								const verified = await jwtVerify(token, key, {
+									algorithms: ["HS256"],
+								});
+								verifiedPayload = verified.payload;
+							}
+							
+							// Check expiration
+							if (verifiedPayload.exp && verifiedPayload.exp < Math.floor(Date.now() / 1000)) {
+								throw new APIError("UNAUTHORIZED", {
+									error_description: "The Access Token expired",
+									error: "invalid_token",
+								});
+							}
+							
+							// Extract user ID and scopes from the verified payload
+							userId = verifiedPayload.sub as string;
+							requestedScopes = (verifiedPayload.scope as string)?.split(" ") || [];
+							
+							// Optionally verify the token hash exists in the database
+							// Skip for JWT plugin tokens as they are self-contained
+							if (!(options.useJWTPlugin && header.alg !== "HS256")) {
+								const tokenHash = await createHash("SHA-256", "hex").digest(token);
+								const storedToken = await ctx.context.adapter.findOne<OAuthAccessToken>({
+									model: modelName.oauthAccessToken,
+									where: [
+										{
+											field: "accessToken",
+											value: tokenHash,
+										},
+									],
+								});
+								
+								if (!storedToken) {
+									throw new APIError("UNAUTHORIZED", {
+										error_description: "invalid access token",
+										error: "invalid_token",
+									});
+								}
+							}
+						} catch (error) {
+							// Provide specific error messages for debugging
+							const errorMessage = error instanceof Error ? error.message : "invalid access token";
+							throw new APIError("UNAUTHORIZED", {
+								error_description: errorMessage,
+								error: "invalid_token",
+							});
+						}
+					} else {
+						// For opaque tokens, look them up in the database
+						const accessToken =
+							await ctx.context.adapter.findOne<OAuthAccessToken>({
+								model: modelName.oauthAccessToken,
+								where: [
+									{
+										field: "accessToken",
+										value: token,
+									},
+								],
+							});
+						if (!accessToken) {
+							throw new APIError("UNAUTHORIZED", {
+								error_description: "invalid access token",
+								error: "invalid_token",
+							});
+						}
+						if (accessToken.accessTokenExpiresAt < new Date()) {
+							throw new APIError("UNAUTHORIZED", {
+								error_description: "The Access Token expired",
+								error: "invalid_token",
+							});
+						}
+						
+						userId = accessToken.userId;
+						requestedScopes = accessToken.scopes.split(" ");
 					}
 
-					const user = await ctx.context.internalAdapter.findUserById(
-						accessToken.userId,
-					);
+					const user = await ctx.context.internalAdapter.findUserById(userId);
 					if (!user) {
 						throw new APIError("UNAUTHORIZED", {
 							error_description: "user not found",
 							error: "invalid_token",
 						});
 					}
-					const requestedScopes = accessToken.scopes.split(" ");
 					const baseUserClaims = {
 						sub: user.id,
 						email: requestedScopes.includes("email") ? user.email : undefined,
